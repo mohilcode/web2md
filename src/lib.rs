@@ -8,6 +8,7 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
 use std::cell::RefCell;
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 struct ConvertRequest {
@@ -91,6 +92,7 @@ struct MarkdownFormatter {
     current_row: Vec<String>,
     current_cell: String,
     metadata: MetadataHandler,
+    in_code_block: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +157,7 @@ impl MarkdownFormatter {
             current_row: Vec::new(),
             current_cell: String::new(),
             metadata: MetadataHandler::new(),
+            in_code_block: false,
         }
     }
 
@@ -178,7 +181,7 @@ impl MarkdownFormatter {
     }
 
     fn clean_text(&self, text: &str) -> String {
-        if !self.config.clean_whitespace {
+        if !self.config.clean_whitespace || self.in_code_block {
             return text.to_string();
         }
 
@@ -215,6 +218,40 @@ impl MarkdownFormatter {
                     "a" => self.process_link(handle, attrs),
                     "img" => self.process_image(handle, attrs),
                     "meta" if self.config.include_metadata => self.extract_metadata(handle, attrs),
+
+                    "pre" => {
+                        self.in_code_block = true;
+                        self.add_double_newline();
+                        self.content.push_str("```");
+
+                        // Check for language in class attribute
+                        if let Some(class) = attrs.borrow().iter()
+                            .find(|attr| attr.name.local.as_ref() == "class")
+                            .map(|attr| attr.value.as_ref())
+                        {
+                            if let Some(lang) = class.split_whitespace()
+                                .find(|c| c.starts_with("language-"))
+                                .map(|c| &c[9..])
+                            {
+                                self.content.push_str(lang);
+                            }
+                        }
+
+                        self.content.push('\n');
+                        self.process_children(handle);
+                        self.content.push_str("\n```");
+                        self.add_newline();
+                        self.in_code_block = false;
+                    }
+
+                    "code" => {
+                        let was_in_code = self.in_code_block;
+                        self.in_code_block = true;
+                        self.content.push('`');
+                        self.process_children(handle);
+                        self.content.push('`');
+                        self.in_code_block = was_in_code;
+                    }
 
                     "table" => {
                         self.in_table = true;
@@ -483,35 +520,103 @@ fn html_to_markdown(html: &str, config: ConvertConfig) -> String {
 async fn fetch_url_with_timeout(url: &str, _timeout_ms: u32) -> Result<String> {
     let mut opts = RequestInit::new();
     opts.method = Method::Get;
+
+    let user_agents = vec![
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    ];
+
+    let index = user_agents.len() - 1;
+    let user_agent = user_agents[index];
+
     opts.headers = Headers::from_iter([
-        ("User-Agent", "Mozilla/5.0 (compatible; Cloudflare Worker)"),
+        ("User-Agent", user_agent),
+        ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+        ("Accept-Language", "en-US,en;q=0.5"),
+        ("Accept-Encoding", "gzip, deflate, br"),
+        ("Connection", "keep-alive"),
+        ("Upgrade-Insecure-Requests", "1"),
+        ("Sec-Fetch-Dest", "document"),
+        ("Sec-Fetch-Mode", "navigate"),
+        ("Sec-Fetch-Site", "cross-site"),
+        ("Sec-Fetch-User", "?1"),
+        ("Cache-Control", "no-cache"),
+        ("Pragma", "no-cache"),
+        ("DNT", "1"),
+        ("Sec-CH-UA", "\"Google Chrome\";v=\"119\", \"Not)A;Brand\";v=\"24\", \"Chromium\";v=\"119\""),
+        ("Sec-CH-UA-Mobile", "?0"),
+        ("Sec-CH-UA-Platform", "\"Windows\""),
     ]);
 
-    let request = Request::new_with_init(url, &opts)?;
+    if let Ok(parsed_url) = Url::parse(url) {
+        if let Some(host) = parsed_url.host_str() {
+            let origin = format!("{}://{}", parsed_url.scheme(), host);
+            opts.headers.set("Referer", &origin)?;
+        }
+    }
 
+    let request = Request::new_with_init(url, &opts)?;
     console_log!("Fetching URL: {}", url);
 
-    let mut response = match Fetch::Request(request).send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            console_error!("Fetch error: {:?}", e);
-            return Err(Error::RustError(format!("Failed to fetch URL: {}", e)));
+    let max_retries = 3;
+    let mut retry_count = 0;
+    let mut response = None;
+
+    while retry_count < max_retries {
+        let req = request.clone()?;
+        match Fetch::Request(req).send().await {
+            Ok(mut resp) => {  // Made resp mutable
+                let status = resp.status_code();
+                let content_type = resp.headers().get("content-type")?.unwrap_or_default();
+
+                if status == 403 || status == 429 {
+                    console_error!("Rate limit or access denied, retrying...");
+                    retry_count += 1;
+                    continue;
+                }
+
+                if status == 200 && content_type.contains("text/html") {
+                    let text = resp.text().await?;
+                    if text.to_lowercase().contains("captcha") {
+                        console_error!("Captcha detected, retrying...");
+                        retry_count += 1;
+                        continue;
+                    }
+                    return Ok(text);
+                }
+
+                response = Some(resp);
+                break;
+            }
+            Err(e) => {
+                console_error!("Fetch error on attempt {}: {:?}", retry_count + 1, e);
+                retry_count += 1;
+
+                if retry_count == max_retries {
+                    return Err(Error::RustError(format!("Failed to fetch URL after {} attempts: {}", max_retries, e)));
+                }
+
+                Delay::from(Duration::from_millis(1000 * 2_u64.pow(retry_count as u32))).await;
+            }
         }
-    };
+    }
+
+    let mut response = response.ok_or_else(|| {  // Made response mutable
+        Error::RustError("Failed to get valid response after retries".to_string())
+    })?;
 
     if response.status_code() >= 400 {
         console_error!("HTTP error: {}", response.status_code());
         return Err(Error::RustError(format!("HTTP error: {}", response.status_code())));
     }
 
-    match response.text().await {
-        Ok(text) => Ok(text),
-        Err(e) => {
-            console_error!("Text extraction error: {:?}", e);
-            Err(Error::RustError(format!("Failed to extract text: {}", e)))
-        }
-    }
+    response.text().await.map_err(|e| {
+        console_error!("Text extraction error: {:?}", e);
+        Error::RustError(format!("Failed to extract text: {}", e))
+    })
 }
+
 
 async fn fetch_and_convert(req: ConvertRequest) -> Result<String> {
     let html = fetch_url_with_timeout(&req.url, 10000).await?;
