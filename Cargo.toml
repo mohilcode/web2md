@@ -11,14 +11,11 @@ crate-type = ["cdylib"]
 worker = { version = "0.4.2", features = ['http'] }
 worker-macros = { version = "0.4.2", features = ['http'] }
 console_error_panic_hook = "0.1.1"
-http = "1.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-html5ever = "0.26"
+serde = { version = "1.0", features = ["derive"], default-features = false }
+html5ever = { version = "0.26", default-features = false }
 markup5ever_rcdom = "0.2"
-cfg-if = "1.0"
 lazy_static = "1.4"
-regex = "1.9"
+regex = { version = "1.9", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = true
@@ -26,3 +23,6 @@ strip = true
 codegen-units = 1
 opt-level = 3
 panic = "abort"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O4']

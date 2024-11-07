@@ -1,6 +1,6 @@
 use worker::*;
 use worker_macros::event;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use html5ever::parse_document;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
@@ -47,18 +47,6 @@ struct ConvertRequest {
     include_links: bool,
     #[serde(default)]
     clean_whitespace: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct ConvertResponse {
-    markdown: String,
-    stats: ConversionStats,
-}
-
-#[derive(Debug, Serialize)]
-struct ConversionStats {
-    original_size: usize,
-    converted_size: usize,
 }
 
 struct ConversionContext {
@@ -195,24 +183,13 @@ fn html_to_markdown(html: &str, include_links: bool, clean_whitespace: bool) -> 
     ctx.markdown.trim().to_string()
 }
 
-async fn fetch_and_convert(url: String, include_links: bool, clean_whitespace: bool) -> Result<ConvertResponse> {
+async fn fetch_and_convert(url: String, include_links: bool, clean_whitespace: bool) -> Result<String> {
     let mut response = Fetch::Url(url.parse().unwrap())
         .send()
         .await?;
 
     let html = response.text().await?;
-    let original_size = html.len();
-
-    let markdown = html_to_markdown(&html, include_links, clean_whitespace);
-    let converted_size = markdown.len();
-
-    Ok(ConvertResponse {
-        markdown,
-        stats: ConversionStats {
-            original_size,
-            converted_size,
-        },
-    })
+    Ok(html_to_markdown(&html, include_links, clean_whitespace))
 }
 
 #[event(fetch)]
@@ -221,8 +198,13 @@ pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response
 
     match req.method() {
         Method::Options => {
-            let mut response = Response::empty()?;
-            response = response.with_cors(&Cors::default())?;
+            let mut headers = Headers::new();
+            headers.append("Access-Control-Allow-Origin", "*")?;
+            headers.append("Access-Control-Allow-Methods", "POST, OPTIONS")?;
+            headers.append("Access-Control-Allow-Headers", "Content-Type")?;
+
+            let response = Response::empty()?
+                .with_headers(headers);
             Ok(response.with_status(204))
         },
         Method::Post => {
@@ -234,10 +216,14 @@ pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response
                 request.include_links,
                 request.clean_whitespace
             ).await {
-                Ok(response_data) => {
-                    let mut response = Response::from_json(&response_data)?;
-                    response = response.with_cors(&Cors::default())?;
-                    Ok(response.with_status(200))
+                Ok(markdown) => {
+                    let mut headers = Headers::new();
+                    headers.append("Access-Control-Allow-Origin", "*")?;
+                    headers.append("Content-Type", "text/markdown; charset=utf-8")?;
+
+                    let response = Response::ok(markdown)?
+                        .with_headers(headers);
+                    Ok(response)
                 },
                 Err(e) => Response::error(format!("Conversion failed: {}", e), 500),
             }

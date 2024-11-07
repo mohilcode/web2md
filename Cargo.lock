@@ -1085,15 +1085,12 @@ dependencies = [
 name = "web2markdown"
 version = "0.1.0"
 dependencies = [
- "cfg-if",
  "console_error_panic_hook",
  "html5ever",
- "http",
  "lazy_static",
  "markup5ever_rcdom",
  "regex",
  "serde",
- "serde_json",
  "worker",
  "worker-macros",
 ]
