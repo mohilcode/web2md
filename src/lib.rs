@@ -4,17 +4,49 @@ use serde::{Deserialize, Serialize};
 use html5ever::parse_document;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use lazy_static::lazy_static;
+use regex::Regex;
 
-const NEWLINE: &str = "\n";
-const DOUBLE_NEWLINE: &str = "\n\n";
-const CODE_BLOCK: &str = "\n```\n";
-const LIST_ITEM: &str = "* ";
+lazy_static! {
+    static ref INLINE_ELEMENTS: std::collections::HashSet<&'static str> = {
+        let mut set = std::collections::HashSet::new();
+        set.insert("a");
+        set.insert("span");
+        set.insert("strong");
+        set.insert("em");
+        set.insert("b");
+        set.insert("i");
+        set.insert("code");
+        set
+    };
+
+    static ref BLOCK_ELEMENTS: std::collections::HashSet<&'static str> = {
+        let mut set = std::collections::HashSet::new();
+        set.insert("div");
+        set.insert("p");
+        set.insert("h1");
+        set.insert("h2");
+        set.insert("h3");
+        set.insert("h4");
+        set.insert("h5");
+        set.insert("h6");
+        set.insert("ul");
+        set.insert("ol");
+        set.insert("li");
+        set.insert("pre");
+        set
+    };
+
+    static ref WHITESPACE_REGEX: Regex = Regex::new(r"\s+").unwrap();
+}
 
 #[derive(Debug, Deserialize)]
 struct ConvertRequest {
     url: String,
     #[serde(default)]
     include_links: bool,
+    #[serde(default)]
+    clean_whitespace: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,65 +61,82 @@ struct ConversionStats {
     converted_size: usize,
 }
 
-#[derive(Debug)]
-
 struct ConversionContext {
     include_links: bool,
+    clean_whitespace: bool,
     markdown: String,
+    last_was_block: bool,
+    buffer: Vec<u8>,
 }
 
 impl ConversionContext {
-    fn new(include_links: bool, initial_capacity: usize) -> Self {
+    #[inline]
+    fn new(include_links: bool, clean_whitespace: bool, initial_capacity: usize) -> Self {
         Self {
             include_links,
+            clean_whitespace,
             markdown: String::with_capacity(initial_capacity),
+            last_was_block: false,
+            buffer: Vec::with_capacity(1024),
         }
     }
 
     #[inline]
     fn append(&mut self, s: &str) {
-        self.markdown.push_str(s);
+        if self.clean_whitespace {
+            let cleaned = WHITESPACE_REGEX.replace_all(s.trim(), " ");
+            self.markdown.push_str(&cleaned);
+        } else {
+            self.markdown.push_str(s);
+        }
     }
 
     #[inline]
     fn append_char(&mut self, c: char) {
         self.markdown.push(c);
     }
+
+    #[inline]
+    fn append_newline(&mut self) {
+        if !self.last_was_block {
+            self.markdown.push('\n');
+            self.last_was_block = true;
+        }
+    }
+
+    #[inline]
+    fn flush_buffer(&mut self) {
+        if !self.buffer.is_empty() {
+            if let Ok(s) = String::from_utf8(self.buffer.clone()) {
+                self.append(&s);
+            }
+            self.buffer.clear();
+        }
+    }
 }
 
-fn html_to_markdown(html: &str, include_links: bool) -> String {
-    let estimated_capacity = html.len() / 2;
-
-    let dom = parse_document(RcDom::default(), Default::default())
-        .from_utf8()
-        .read_from(&mut html.as_bytes())
-        .unwrap();
-
-    let mut ctx = ConversionContext::new(include_links, estimated_capacity);
-    process_node(&dom.document, &mut ctx);
-    ctx.markdown.trim().to_string()
-}
-
+#[inline]
 fn process_node(handle: &Handle, ctx: &mut ConversionContext) {
-    let node = &handle.data;
-
-    match node {
-        NodeData::Element { ref name, ref attrs, .. } => {
+    match &handle.data {
+        NodeData::Element { name, attrs, .. } => {
             let tag_name = name.local.as_ref();
+
+            if BLOCK_ELEMENTS.contains(tag_name) {
+                ctx.flush_buffer();
+                ctx.append_newline();
+            }
 
             match tag_name {
                 "p" => {
-                    ctx.append(DOUBLE_NEWLINE);
                     process_children(handle, ctx);
-                    ctx.append(NEWLINE);
+                    ctx.append_newline();
                 },
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                     let level = tag_name.as_bytes()[1] - b'0';
-                    ctx.append(NEWLINE);
                     ctx.append(&"#".repeat(level as usize));
                     ctx.append_char(' ');
                     process_children(handle, ctx);
-                    ctx.append(NEWLINE);
+                    ctx.append_newline();
                 },
                 "a" if ctx.include_links => {
                     if let Some(href) = attrs.borrow()
@@ -104,56 +153,49 @@ fn process_node(handle: &Handle, ctx: &mut ConversionContext) {
                         process_children(handle, ctx);
                     }
                 },
-                "strong" | "b" => {
-                    ctx.append("**");
-                    process_children(handle, ctx);
-                    ctx.append("**");
-                },
-                "em" | "i" => {
-                    ctx.append_char('*');
-                    process_children(handle, ctx);
-                    ctx.append_char('*');
-                },
-                "code" => {
-                    ctx.append_char('`');
-                    process_children(handle, ctx);
-                    ctx.append_char('`');
-                },
-                "pre" => {
-                    ctx.append(CODE_BLOCK);
-                    process_children(handle, ctx);
-                    ctx.append(CODE_BLOCK);
-                },
-                "ul" | "ol" => {
-                    ctx.append(NEWLINE);
-                    process_children(handle, ctx);
-                    ctx.append(NEWLINE);
-                },
                 "li" => {
-                    ctx.append(LIST_ITEM);
+                    ctx.append("* ");
                     process_children(handle, ctx);
-                    ctx.append(NEWLINE);
+                    ctx.append_newline();
                 },
                 _ => process_children(handle, ctx),
             }
         },
-        NodeData::Text { ref contents } => {
+        NodeData::Text { contents } => {
             let text = contents.borrow();
             if !text.trim().is_empty() {
-                ctx.append(text.trim());
+                ctx.buffer.extend_from_slice(text.as_bytes());
             }
         },
         _ => process_children(handle, ctx),
     }
 }
 
+#[inline]
 fn process_children(handle: &Handle, ctx: &mut ConversionContext) {
     for child in handle.children.borrow().iter() {
         process_node(child, ctx);
     }
 }
 
-async fn fetch_and_convert(url: String, include_links: bool) -> Result<ConvertResponse> {
+fn html_to_markdown(html: &str, include_links: bool, clean_whitespace: bool) -> String {
+    let dom = parse_document(RcDom::default(), Default::default())
+        .from_utf8()
+        .read_from(&mut html.as_bytes())
+        .unwrap();
+
+    let mut ctx = ConversionContext::new(
+        include_links,
+        clean_whitespace,
+        html.len() / 2
+    );
+
+    process_node(&dom.document, &mut ctx);
+    ctx.flush_buffer();
+    ctx.markdown.trim().to_string()
+}
+
+async fn fetch_and_convert(url: String, include_links: bool, clean_whitespace: bool) -> Result<ConvertResponse> {
     let mut response = Fetch::Url(url.parse().unwrap())
         .send()
         .await?;
@@ -161,7 +203,7 @@ async fn fetch_and_convert(url: String, include_links: bool) -> Result<ConvertRe
     let html = response.text().await?;
     let original_size = html.len();
 
-    let markdown = html_to_markdown(&html, include_links);
+    let markdown = html_to_markdown(&html, include_links, clean_whitespace);
     let converted_size = markdown.len();
 
     Ok(ConvertResponse {
@@ -174,29 +216,32 @@ async fn fetch_and_convert(url: String, include_links: bool) -> Result<ConvertRe
 }
 
 #[event(fetch)]
-pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> worker::Result<Response> {
+pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
 
-    if req.method() == Method::Options {
-        let mut response = Response::empty()?;
-        response = response.with_cors(&Cors::default())?;
-        return Ok(response.with_status(204));
-    }
-
-    if req.method() != Method::Post {
-        return Response::error("Method Not Allowed", 405);
-    }
-
-    let request: ConvertRequest = req.json().await.map_err(|_| {
-        Error::from("Invalid JSON body")
-    })?;
-
-    match fetch_and_convert(request.url, request.include_links).await {
-        Ok(response_data) => {
-            let mut response = Response::from_json(&response_data)?;
+    match req.method() {
+        Method::Options => {
+            let mut response = Response::empty()?;
             response = response.with_cors(&Cors::default())?;
-            Ok(response.with_status(200))
+            Ok(response.with_status(204))
         },
-        Err(_) => Response::error("Conversion failed", 500),
+        Method::Post => {
+            let request: ConvertRequest = req.json().await
+                .map_err(|_| Error::from("Invalid JSON body"))?;
+
+            match fetch_and_convert(
+                request.url,
+                request.include_links,
+                request.clean_whitespace
+            ).await {
+                Ok(response_data) => {
+                    let mut response = Response::from_json(&response_data)?;
+                    response = response.with_cors(&Cors::default())?;
+                    Ok(response.with_status(200))
+                },
+                Err(e) => Response::error(format!("Conversion failed: {}", e), 500),
+            }
+        },
+        _ => Response::error("Method Not Allowed", 405),
     }
 }
