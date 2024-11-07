@@ -1,0 +1,6 @@
+name = "web2markdown"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-11-07"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
