@@ -5,6 +5,11 @@ use html5ever::parse_document;
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 
+const NEWLINE: &str = "\n";
+const DOUBLE_NEWLINE: &str = "\n\n";
+const CODE_BLOCK: &str = "\n```\n";
+const LIST_ITEM: &str = "* ";
+
 #[derive(Debug, Deserialize)]
 struct ConvertRequest {
     url: String,
@@ -24,18 +29,46 @@ struct ConversionStats {
     converted_size: usize,
 }
 
+#[derive(Debug)]
+
+struct ConversionContext {
+    include_links: bool,
+    markdown: String,
+}
+
+impl ConversionContext {
+    fn new(include_links: bool, initial_capacity: usize) -> Self {
+        Self {
+            include_links,
+            markdown: String::with_capacity(initial_capacity),
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, s: &str) {
+        self.markdown.push_str(s);
+    }
+
+    #[inline]
+    fn append_char(&mut self, c: char) {
+        self.markdown.push(c);
+    }
+}
+
 fn html_to_markdown(html: &str, include_links: bool) -> String {
+    let estimated_capacity = html.len() / 2;
+
     let dom = parse_document(RcDom::default(), Default::default())
         .from_utf8()
         .read_from(&mut html.as_bytes())
         .unwrap();
 
-    let mut markdown = String::new();
-    process_node(&dom.document, &mut markdown, include_links);
-    markdown.trim().to_string()
+    let mut ctx = ConversionContext::new(include_links, estimated_capacity);
+    process_node(&dom.document, &mut ctx);
+    ctx.markdown.trim().to_string()
 }
 
-fn process_node(handle: &Handle, markdown: &mut String, include_links: bool) {
+fn process_node(handle: &Handle, ctx: &mut ConversionContext) {
     let node = &handle.data;
 
     match node {
@@ -44,86 +77,100 @@ fn process_node(handle: &Handle, markdown: &mut String, include_links: bool) {
 
             match tag_name {
                 "p" => {
-                    markdown.push_str("\n\n");
-                    process_children(handle, markdown, include_links);
-                    markdown.push('\n');
+                    ctx.append(DOUBLE_NEWLINE);
+                    process_children(handle, ctx);
+                    ctx.append(NEWLINE);
                 },
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                    let level = tag_name[1..].parse::<usize>().unwrap();
-                    markdown.push_str("\n");
-                    markdown.push_str(&"#".repeat(level));
-                    markdown.push(' ');
-                    process_children(handle, markdown, include_links);
-                    markdown.push('\n');
+                    let level = tag_name.as_bytes()[1] - b'0';
+                    ctx.append(NEWLINE);
+                    ctx.append(&"#".repeat(level as usize));
+                    ctx.append_char(' ');
+                    process_children(handle, ctx);
+                    ctx.append(NEWLINE);
                 },
-                "a" if include_links => {
-                    let href = attrs.borrow()
+                "a" if ctx.include_links => {
+                    if let Some(href) = attrs.borrow()
                         .iter()
                         .find(|attr| attr.name.local.as_ref() == "href")
-                        .map(|attr| attr.value.to_string());
-
-                    if let Some(href) = href {
-                        markdown.push('[');
-                        process_children(handle, markdown, include_links);
-                        markdown.push_str("](");
-                        markdown.push_str(&href);
-                        markdown.push(')');
+                        .map(|attr| &attr.value)
+                    {
+                        ctx.append_char('[');
+                        process_children(handle, ctx);
+                        ctx.append("](");
+                        ctx.append(href);
+                        ctx.append_char(')');
                     } else {
-                        process_children(handle, markdown, include_links);
+                        process_children(handle, ctx);
                     }
                 },
                 "strong" | "b" => {
-                    markdown.push_str("**");
-                    process_children(handle, markdown, include_links);
-                    markdown.push_str("**");
+                    ctx.append("**");
+                    process_children(handle, ctx);
+                    ctx.append("**");
                 },
                 "em" | "i" => {
-                    markdown.push('*');
-                    process_children(handle, markdown, include_links);
-                    markdown.push('*');
+                    ctx.append_char('*');
+                    process_children(handle, ctx);
+                    ctx.append_char('*');
                 },
                 "code" => {
-                    markdown.push('`');
-                    process_children(handle, markdown, include_links);
-                    markdown.push('`');
+                    ctx.append_char('`');
+                    process_children(handle, ctx);
+                    ctx.append_char('`');
                 },
                 "pre" => {
-                    markdown.push_str("\n```\n");
-                    process_children(handle, markdown, include_links);
-                    markdown.push_str("\n```\n");
+                    ctx.append(CODE_BLOCK);
+                    process_children(handle, ctx);
+                    ctx.append(CODE_BLOCK);
                 },
-                "ul" => {
-                    markdown.push('\n');
-                    process_children(handle, markdown, include_links);
-                    markdown.push('\n');
-                },
-                "ol" => {
-                    markdown.push('\n');
-                    process_children(handle, markdown, include_links);
-                    markdown.push('\n');
+                "ul" | "ol" => {
+                    ctx.append(NEWLINE);
+                    process_children(handle, ctx);
+                    ctx.append(NEWLINE);
                 },
                 "li" => {
-                    markdown.push_str("* ");
-                    process_children(handle, markdown, include_links);
-                    markdown.push('\n');
+                    ctx.append(LIST_ITEM);
+                    process_children(handle, ctx);
+                    ctx.append(NEWLINE);
                 },
-                _ => process_children(handle, markdown, include_links),
+                _ => process_children(handle, ctx),
             }
         },
         NodeData::Text { ref contents } => {
-            let text = contents.borrow().to_string();
+            let text = contents.borrow();
             if !text.trim().is_empty() {
-                markdown.push_str(&text.trim());
+                ctx.append(text.trim());
             }
         },
-        _ => process_children(handle, markdown, include_links),
+        _ => process_children(handle, ctx),
     }
 }
 
-fn process_children(handle: &Handle, markdown: &mut String, include_links: bool) {
+fn process_children(handle: &Handle, ctx: &mut ConversionContext) {
     for child in handle.children.borrow().iter() {
-        process_node(child, markdown, include_links);
+        process_node(child, ctx);
     }
+}
+
+async fn fetch_and_convert(url: String, include_links: bool) -> Result<ConvertResponse> {
+    let mut response = Fetch::Url(url.parse().unwrap())
+        .send()
+        .await?;
+
+    let html = response.text().await?;
+    let original_size = html.len();
+
+    let markdown = html_to_markdown(&html, include_links);
+    let converted_size = markdown.len();
+
+    Ok(ConvertResponse {
+        markdown,
+        stats: ConversionStats {
+            original_size,
+            converted_size,
+        },
+    })
 }
 
 #[event(fetch)]
@@ -140,34 +187,16 @@ pub async fn main(mut req: Request, _env: Env, _ctx: Context) -> worker::Result<
         return Response::error("Method Not Allowed", 405);
     }
 
-    let request: ConvertRequest = match req.json().await {
-        Ok(req) => req,
-        Err(_) => return Response::error("Invalid JSON body", 400),
-    };
+    let request: ConvertRequest = req.json().await.map_err(|_| {
+        Error::from("Invalid JSON body")
+    })?;
 
-    let mut response = match Fetch::Url(request.url.parse().unwrap()).send().await {
-        Ok(resp) => resp,
-        Err(_) => return Response::error("Failed to fetch URL", 400),
-    };
-
-    let html = match response.text().await {
-        Ok(text) => text,
-        Err(_) => return Response::error("Failed to read response", 500),
-    };
-
-    let original_size = html.len();
-
-    let markdown = html_to_markdown(&html, request.include_links);
-
-    let response_data = ConvertResponse {
-        markdown: markdown.clone(),
-        stats: ConversionStats {
-            original_size,
-            converted_size: markdown.len(),
+    match fetch_and_convert(request.url, request.include_links).await {
+        Ok(response_data) => {
+            let mut response = Response::from_json(&response_data)?;
+            response = response.with_cors(&Cors::default())?;
+            Ok(response.with_status(200))
         },
-    };
-
-    let mut response = Response::from_json(&response_data)?;
-    response = response.with_cors(&Cors::default())?;
-    Ok(response.with_status(200))
+        Err(_) => Response::error("Conversion failed", 500),
+    }
 }
